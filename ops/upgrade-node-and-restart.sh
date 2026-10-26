@@ -10,7 +10,7 @@
 #   bash ops/upgrade-node-and-restart.sh
 
 # ==================== 运行配置（直接改这里） ====================
-APP_NAME="broser-service"      # pm2 里的服务名
+APP_NAME="browser-service"     # pm2 里的服务名（找不到时，pm2 里只有一个服务就自动用它）
 TARGET_NODE="24.22.1"          # 目标 Node 版本（24.x 线安全版本 ≥ 24.22.1）
 APP_DIR=""                     # 项目目录；留空=从 pm2 记录自动识别（pm2 记录全丢了才需要填）
 APP_ENTRY=""                   # 入口脚本（相对 APP_DIR 或绝对路径）；留空=自动识别
@@ -21,8 +21,6 @@ UNINSTALL_OLD_NVM_NODES=false  # true=卸载 nvm 下其他有漏洞的 Node 版�
 
 set -o pipefail
 
-LAUNCH_LABEL="com.aftership.${APP_NAME}.pm2"
-LAUNCH_PLIST="$HOME/Library/LaunchAgents/${LAUNCH_LABEL}.plist"
 CHROME_APP="/Applications/Google Chrome.app"
 BACKUP_DIR="$HOME/${APP_NAME}-upgrade-backup-$(date +%Y%m%d-%H%M%S)"
 
@@ -80,6 +78,18 @@ process.stdin.on("data", d => s += d).on("end", () => {
     const e = p.pm2_env || {}
     console.log([e.status, p.pid, e.pm_cwd, e.pm_exec_path, e.node_version, e.exec_interpreter].join("|"))
 })' "$APP_NAME"
+}
+
+# pm2 里所有服务名，一行一个
+pm2_names() {
+    [ -n "$PM2" ] || return 0
+    "$PM2" jlist 2>/dev/null | node -e '
+let s = ""
+process.stdin.on("data", d => s += d).on("end", () => {
+    const line = s.split("\n").reverse().find(l => l.trim().startsWith("[{") || l.trim() === "[]")
+    if (!line) return
+    try { [...new Set(JSON.parse(line).map(p => p.name))].forEach(n => console.log(n)) } catch (e) {}
+})'
 }
 
 # pm2 进程都没了时，从 ~/.pm2/dump.pm2 读取目录和入口
@@ -154,10 +164,20 @@ info "node : ${OLD_NODE:-未安装}  ${OLD_NODE_VER}"
 info "pm2  : ${PM2:-未安装}"
 [ -n "$OLD_NODE" ] || die "找不到 node。如果之前用 nvm，请确认 ~/.nvm 存在"
 
-if [ -n "$PM2" ] && [ -z "$(pm2_app_info)" ]; then
-    log "pm2 里没有 $APP_NAME（机器重启过？），尝试 pm2 resurrect 恢复上次保存的进程"
+if [ -n "$PM2" ] && [ -z "$(pm2_names)" ]; then
+    log "pm2 里一个进程都没有（机器重启过？），尝试 pm2 resurrect 恢复上次保存的进程"
     "$PM2" resurrect >/dev/null 2>&1 || true
     sleep 5
+fi
+
+if [ -n "$PM2" ] && [ -z "$(pm2_app_info)" ]; then
+    names="$(pm2_names)"
+    if [ -n "$names" ] && [ "$(echo "$names" | wc -l | tr -d ' ')" = "1" ]; then
+        warn "pm2 里没有 ${APP_NAME}，只有一个服务「${names}」，按它处理"
+        APP_NAME="$names"
+    elif [ -n "$names" ]; then
+        warn "pm2 里没有 ${APP_NAME}，现有服务：$(echo "$names" | tr '\n' ' ')；请把脚本顶部 APP_NAME 改成正确的名字"
+    fi
 fi
 
 log "$APP_NAME 当前运行情况"
@@ -230,16 +250,27 @@ elif command -v fnm >/dev/null 2>&1; then
 else
     case "$OLD_NODE" in
         "$(brew --prefix 2>/dev/null)"/*)
-            formula="$(brew list --formula 2>/dev/null | grep -E '^node(@[0-9]+)?$' | head -1)"
-            info "当前 node 来自 Homebrew（$formula），先尝试 brew upgrade"
-            brew update >/dev/null && brew upgrade "$formula"
-            hash -r
-            if node_is_safe "$(node -v)"; then
-                NEW_NODE="$(command -v node)"
+            # brew 的 node 跟最新大版本走（现在是 25，没有补丁），改用 node@24 并接管 brew 的 node 链接
+            major="${TARGET_NODE%%.*}"
+            info "当前 node 来自 Homebrew，安装 node@${major} 并把 $(brew --prefix)/bin/node 切到它"
+            brew update >/dev/null
+            if brew list --versions "node@${major}" >/dev/null 2>&1; then
+                brew upgrade "node@${major}"
             else
-                warn "Homebrew 的 $formula 还不是安全版本，改装 nodejs.org 官方包到 /usr/local/bin"
+                brew install "node@${major}" || die "brew install node@${major} 失败"
+            fi
+            brew_node="$(brew --prefix "node@${major}")/bin/node"
+            brew unlink node >/dev/null 2>&1 || true
+            if [ -x "$brew_node" ] && node_is_safe "$("$brew_node" -v)"; then
+                brew link --force --overwrite "node@${major}" >/dev/null || die "brew link node@${major} 失败"
+                NEW_NODE="$(brew --prefix)/bin/node"
+            else
+                warn "Homebrew 的 node@${major} 是 $("$brew_node" -v 2>/dev/null)，还不是安全版本，改装 nodejs.org 官方包到 /usr/local/bin"
                 install_node_pkg
             fi
+            info "顺带升级 Homebrew 的 brotli（要求 ≥ 1.2.1）"
+            brew upgrade brotli >/dev/null 2>&1 || true
+            info "brotli: $(brew list --versions brotli 2>/dev/null)"
             ;;
         *) install_node_pkg ;;
     esac
@@ -274,7 +305,7 @@ log "用新 pm2 恢复进程"
 "$PM2" resurrect >/dev/null 2>&1 || true
 sleep 3
 if [ -z "$(pm2_app_info)" ]; then
-    warn "dump 里没有 $APP_NAME，按目录/入口新建（原来通过 pm2 设置的环境变量需要自己补）"
+    warn "dump 里没有 ${APP_NAME}，按目录/入口新建（原来通过 pm2 设置的环境变量需要自己补）"
     (cd "$APP_DIR" && "$PM2" start "$APP_ENTRY" --name "$APP_NAME" --interpreter "$NEW_NODE") || die "pm2 start 失败"
 fi
 
@@ -299,6 +330,8 @@ IFS='|' read -r _ cur_ver <<< "$(real_node_of_pid "$pid")"
 
 # ---------------------------------------------------------------- 5. 开机/登录自动拉起
 if [ "$SETUP_AUTOSTART" = true ]; then
+    LAUNCH_LABEL="com.aftership.${APP_NAME}.pm2"
+    LAUNCH_PLIST="$HOME/Library/LaunchAgents/${LAUNCH_LABEL}.plist"
     log "配置登录后自动拉起 pm2：$LAUNCH_PLIST"
     mkdir -p "$HOME/Library/LaunchAgents"
     [ -f "$LAUNCH_PLIST" ] && cp -p "$LAUNCH_PLIST" "$BACKUP_DIR/"
@@ -378,12 +411,19 @@ if type nvm >/dev/null 2>&1; then
         elif [ "$UNINSTALL_OLD_NVM_NODES" = true ]; then
             nvm uninstall "$v" >/dev/null && info "$v  有漏洞，已卸载"
         else
-            warn "$v 有漏洞（把 UNINSTALL_OLD_NVM_NODES 改成 true 可自动卸载，或手动 nvm uninstall $v）"
+            warn "$v 有漏洞（把 UNINSTALL_OLD_NVM_NODES 改成 true 可自动卸载，或手动 nvm uninstall ${v}）"
         fi
     done
 fi
 
+if command -v brew >/dev/null 2>&1; then
+    old_brew_node="$(brew list --versions node 2>/dev/null | awk '{print $2}')"
+    if [ -n "$old_brew_node" ] && ! node_is_safe "$old_brew_node"; then
+        warn "Homebrew 里还装着有漏洞的 node ${old_brew_node}（已取消链接，不再是默认 node）。确认没别的东西依赖后可执行：brew uninstall node"
+    fi
+fi
+
 log "完成"
-info "Node: $OLD_NODE_VER → $NEW_NODE_VER，服务已用新 Node 跑起来并 pm2 save"
+info "Node: $OLD_NODE_VER → ${NEW_NODE_VER}，服务已用新 Node 跑起来并 pm2 save"
 info "备份目录: $BACKUP_DIR"
 info "回滚: 用旧 node 的 pm2 执行 pm2 kill && cp $BACKUP_DIR/dump.pm2 ~/.pm2/ && pm2 resurrect"
