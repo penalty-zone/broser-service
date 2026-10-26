@@ -98,20 +98,41 @@ listen_port_of_pid() {
     lsof -nP -iTCP -sTCP:LISTEN -a -p "$1" 2>/dev/null | awk 'NR>1 {print $9}' | sed 's/.*://' | sort -u | head -1
 }
 
+# 服务进程实际在用的 node（pm2 记录的 node_version 可能是守护进程的版本，不可靠）
+# 输出：可执行文件路径|版本
+real_node_of_pid() {
+    local exe
+    [ -n "$1" ] && [ "$1" != "0" ] || return 0
+    exe="$(lsof -a -p "$1" -d txt -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)"
+    [ -x "$exe" ] && echo "$exe|$("$exe" -v 2>/dev/null)"
+}
+
+# 等服务 online 并开始监听端口，最多 60 秒
+wait_online() {
+    local st pid
+    for _ in $(seq 1 30); do
+        IFS='|' read -r st pid _ _ _ _ <<< "$(pm2_app_info)"
+        [ "$st" = "online" ] && [ -n "$(listen_port_of_pid "$pid")" ] && return 0
+        sleep 2
+    done
+    return 1
+}
+
 print_status() {
-    local info status pid cwd entry nver interp port
+    local info status pid cwd entry nver interp port real_exe real_ver
     info="$(pm2_app_info)"
     if [ -z "$info" ]; then
         warn "pm2 里没有找到 $APP_NAME"
         return 1
     fi
     IFS='|' read -r status pid cwd entry nver interp <<< "$info"
+    IFS='|' read -r real_exe real_ver <<< "$(real_node_of_pid "$pid")"
     port="$(listen_port_of_pid "$pid")"
     info "服务名      : $APP_NAME"
     info "状态 / PID  : $status / $pid"
     info "项目目录    : $cwd"
     info "入口脚本    : $entry"
-    info "Node 版本   : $nver   (interpreter: $interp)"
+    info "Node 版本   : ${real_ver:-未知}   (${real_exe:-interpreter: $interp})"
     info "监听端口    : ${port:-未检测到}"
     if [ -n "$port" ]; then
         info "健康检查    : $(curl -s -m 5 "http://127.0.0.1:$port/health" 2>/dev/null | head -c 300)"
@@ -257,23 +278,22 @@ if [ -z "$(pm2_app_info)" ]; then
     (cd "$APP_DIR" && "$PM2" start "$APP_ENTRY" --name "$APP_NAME" --interpreter "$NEW_NODE") || die "pm2 start 失败"
 fi
 
-# dump 里如果写死了旧 node 的绝对路径，这里改成新 node
-IFS='|' read -r _ _ _ _ cur_ver _ <<< "$(pm2_app_info)"
-if [ "$cur_ver" != "${NEW_NODE_VER#v}" ]; then
-    info "服务还在用 Node $cur_ver，切换 interpreter 到 $NEW_NODE"
+log "等待服务启动（最多 60 秒）"
+wait_online || die "服务没有 online，看日志：pm2 logs $APP_NAME --lines 100"
+
+# dump 里如果写死了旧 node 的绝对路径，服务会还在旧 node 上，这里改成新 node
+IFS='|' read -r _ pid _ _ _ _ <<< "$(pm2_app_info)"
+IFS='|' read -r _ cur_ver <<< "$(real_node_of_pid "$pid")"
+if [ "$cur_ver" != "$NEW_NODE_VER" ]; then
+    info "服务还在用 Node ${cur_ver:-未知}，切换 interpreter 到 $NEW_NODE"
     "$PM2" restart "$APP_NAME" --interpreter "$NEW_NODE" >/dev/null || die "pm2 restart 失败"
+    wait_online || die "服务没有 online，看日志：pm2 logs $APP_NAME --lines 100"
 fi
 
-log "等待服务启动（最多 60 秒）"
-for _ in $(seq 1 30); do
-    IFS='|' read -r st pid _ _ _ _ <<< "$(pm2_app_info)"
-    [ "$st" = "online" ] && [ -n "$(listen_port_of_pid "$pid")" ] && break
-    sleep 2
-done
 print_status || true
-IFS='|' read -r st _ _ _ cur_ver _ <<< "$(pm2_app_info)"
-[ "$st" = "online" ] || die "服务没有 online，看日志：pm2 logs $APP_NAME --lines 100"
-[ "$cur_ver" = "${NEW_NODE_VER#v}" ] || die "服务仍在用 Node $cur_ver"
+IFS='|' read -r _ pid _ _ _ _ <<< "$(pm2_app_info)"
+IFS='|' read -r _ cur_ver <<< "$(real_node_of_pid "$pid")"
+[ "$cur_ver" = "$NEW_NODE_VER" ] || die "服务仍在用 Node ${cur_ver:-未知}，请检查 pm2 describe $APP_NAME"
 
 "$PM2" save --force >/dev/null && info "已 pm2 save"
 
