@@ -132,6 +132,32 @@ real_node_of_pid() {
     done
 }
 
+# 服务用的 node 版本：优先读进程树，读不到就按 pm2 的 interpreter 推断
+# 输出：版本|来源说明
+service_node_ver() {
+    local pid interp real_ver
+    IFS='|' read -r _ pid _ _ _ interp <<< "$(pm2_app_info)"
+    IFS='|' read -r _ real_ver <<< "$(real_node_of_pid "$pid")"
+    if [ -n "$real_ver" ]; then
+        echo "$real_ver|进程实际"
+    elif [ -x "$interp" ] && [ "$(basename "$interp")" = "node" ]; then
+        echo "$("$interp" -v 2>/dev/null)|按 interpreter $interp 推断"
+    elif [ "$interp" = "node" ] && [ -n "${NEW_NODE:-}" ]; then
+        echo "$("$NEW_NODE" -v 2>/dev/null)|按 pm2 守护进程的 node 推断"
+    fi
+}
+
+# pm2 守护进程用的 node 版本（pm2 记录的 node_version 就是守护进程的版本）
+daemon_node_ver() {
+    local ver
+    IFS='|' read -r _ ver <<< "$(real_node_of_pid "$(cat "$HOME/.pm2/pm2.pid" 2>/dev/null)")"
+    if [ -z "$ver" ]; then
+        IFS='|' read -r _ _ _ _ ver _ <<< "$(pm2_app_info)"
+        [ -n "$ver" ] && ver="v${ver#v}"
+    fi
+    echo "$ver"
+}
+
 # 等服务 online（最多 60 秒），再等它开始监听端口（最多 30 秒，等不到只提示）
 wait_online() {
     local st pid ok=false
@@ -159,20 +185,20 @@ die_with_logs() {
 }
 
 print_status() {
-    local info status pid cwd entry nver interp port real_exe real_ver
+    local info status pid cwd entry nver interp port svc_ver svc_src
     info="$(pm2_app_info)"
     if [ -z "$info" ]; then
         warn "pm2 里没有找到 $APP_NAME"
         return 1
     fi
     IFS='|' read -r status pid cwd entry nver interp <<< "$info"
-    IFS='|' read -r real_exe real_ver <<< "$(real_node_of_pid "$pid")"
+    IFS='|' read -r svc_ver svc_src <<< "$(service_node_ver)"
     port="$(listen_port_of_pid "$pid")"
     info "服务名      : $APP_NAME"
     info "状态 / PID  : $status / $pid"
     info "项目目录    : $cwd"
     info "入口脚本    : $entry"
-    info "Node 版本   : ${real_ver:-未知}   (${real_exe:-interpreter: $interp})"
+    info "Node 版本   : ${svc_ver:-未知}   (${svc_src:-interpreter: $interp})"
     info "监听端口    : ${port:-未检测到}"
     if [ -n "$port" ]; then
         info "健康检查    : $(curl -s -m 5 "http://127.0.0.1:$port/health" 2>/dev/null | head -c 300)"
@@ -326,9 +352,9 @@ info "pm2：$PM2  $("$PM2" -v 2>/dev/null | tail -1)"
 
 # ---------------------------------------------------------------- 4. 用新 Node 重启服务
 # 守护进程和服务都已经在新 node 上（比如重跑脚本）就不再重启，避免服务中断
-IFS='|' read -r st pid _ _ _ _ <<< "$(pm2_app_info)"
-IFS='|' read -r _ svc_ver <<< "$(real_node_of_pid "$pid")"
-IFS='|' read -r _ daemon_ver <<< "$(real_node_of_pid "$(cat "$HOME/.pm2/pm2.pid" 2>/dev/null)")"
+IFS='|' read -r st _ _ _ _ _ <<< "$(pm2_app_info)"
+IFS='|' read -r svc_ver _ <<< "$(service_node_ver)"
+daemon_ver="$(daemon_node_ver)"
 if [ "$st" = "online" ] && [ "$svc_ver" = "$NEW_NODE_VER" ] && [ "$daemon_ver" = "$NEW_NODE_VER" ]; then
     log "pm2 守护进程和服务都已经在 Node $NEW_NODE_VER 上，跳过重启"
 else
@@ -351,8 +377,7 @@ log "等待服务启动"
 wait_online || die_with_logs "服务没有 online"
 
 # dump 里如果写死了旧 node 的绝对路径，服务会还在旧 node 上，这里改成新 node
-IFS='|' read -r _ pid _ _ _ _ <<< "$(pm2_app_info)"
-IFS='|' read -r _ cur_ver <<< "$(real_node_of_pid "$pid")"
+IFS='|' read -r cur_ver _ <<< "$(service_node_ver)"
 if [ "$cur_ver" != "$NEW_NODE_VER" ]; then
     info "服务还在用 Node ${cur_ver:-未知}，切换 interpreter 到 $NEW_NODE"
     "$PM2" restart "$APP_NAME" --interpreter "$NEW_NODE" >/dev/null || die "pm2 restart 失败"
@@ -360,9 +385,9 @@ if [ "$cur_ver" != "$NEW_NODE_VER" ]; then
 fi
 
 print_status || true
-IFS='|' read -r _ pid _ _ _ _ <<< "$(pm2_app_info)"
-IFS='|' read -r _ cur_ver <<< "$(real_node_of_pid "$pid")"
+IFS='|' read -r cur_ver cur_src <<< "$(service_node_ver)"
 [ "$cur_ver" = "$NEW_NODE_VER" ] || die "服务仍在用 Node ${cur_ver:-未知}，请检查 pm2 describe $APP_NAME"
+[ "$cur_src" = "进程实际" ] || warn "没能直接读到服务进程的 node，版本是${cur_src}的"
 
 "$PM2" save --force >/dev/null && info "已 pm2 save"
 
